@@ -49,7 +49,7 @@ def _read_utf16(file_path: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     try:
-        df = pd.read_csv(StringIO(text), sep='\t', on_bad_lines='skip')
+        df = pd.read_csv(StringIO(text), sep='\t', on_bad_lines='skip', engine='python')
     except Exception:
         return pd.DataFrame()
 
