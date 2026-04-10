@@ -1,217 +1,230 @@
+"""
+factory_engine.py — A-APOS SimPy 핵심 엔진 (Final)
+
+SMT 2020 데이터 기반 설계 원칙:
+- BATCH MINIMUM/MAXIMUM: Wafers 기준 (25 wafers/lot)
+- PROCESSING UNIT: Batch=설비당 1회 처리, Wafer=웨이퍼별, Lot=lot 단위
+- 고장: is_down 플래그만 사용 (Resource interrupt 없음 → Preempted 에러 방지)
+- 배치: 리더/멤버 구조, 리더만 설비 점유
+"""
 import simpy
 import random
 
+
 class Lot:
-    def __init__(self, lot_id, part, start_time, priority, setup_req, due_date=None):
-        self.id = lot_id
-        self.part = part
-        self.start_time = start_time
-        self.priority = priority
-        self.setup_req = setup_req
-        self.due_date = due_date          # 납기일 (분 단위)
-        self.current_step = 0             # 현재 공정 단계
-        self.total_steps = 0              # 전체 공정 단계 수
-        self.current_station = None       # 현재 위치한 설비명
-        self.wait_start = None            # 대기 시작 시간 (Queue Time 계산용)
-        self.finish_time = None           # 완료 시각
-        self.wait_event = None
+    def __init__(self, lot_id, part, start_time, priority,
+                 wafers=25, setup_req="", due_date=None):
+        self.id              = lot_id
+        self.part            = part
+        self.start_time      = start_time
+        self.priority        = priority
+        self.wafers          = wafers       # WAFERS PER LOT (보통 25)
+        self.setup_req       = setup_req
+        self.due_date        = due_date
+        self.current_step    = 0
+        self.total_steps     = 0
+        self.current_station = None
+        self.finish_time     = None
+        self.wait_event      = None
+        self.batch_done_ev   = None   # 배치 완료 이벤트 (리더가 심어줌)
+        self.is_leader       = False  # 배치 리더 여부
 
     @property
-    def critical_ratio(self):
-        """CR = 잔여 납기 시간 / 잔여 공정 단계 수 (낮을수록 긴급)"""
-        if self.due_date is None or self.total_steps == 0:
-            return 999.0
-        remaining_steps = max(1, self.total_steps - self.current_step)
-        remaining_time = self.due_date - self._env_now
-        return remaining_time / remaining_steps
-
-    @property
-    def is_tardy(self):
-        """납기 초과 여부"""
-        if self.due_date is None:
+    def is_tardy(self) -> bool:
+        if self.due_date is None or self.finish_time is None:
             return False
-        return self._env_now > self.due_date
-
-    # env.now를 외부에서 주입받기 위한 setter
-    def set_env(self, env):
-        self._env_now = env.now
-        return self
+        return self.finish_time > self.due_date
 
 
 class AdvancedStation:
-    def __init__(self, env, name, capacity=1, is_batch=False, min_batch=0):
-        self.env = env
-        self.name = name
-        self.capacity = capacity
-        self.res = simpy.PreemptiveResource(env, capacity=capacity)
-        self.current_setup = None
-        self.is_batch = is_batch
-        self.min_batch = min_batch
-        self.batch_queue = []
-        self.is_down = False              # ← 고장 상태 플래그 추가
+    """
+    배치 처리 흐름:
+    1. Lot이 도착 → batch_queue에 추가
+    2. 총 wafers >= batch_min_wafers → 즉시 배치 출발
+    3. BATCH_WAIT_MAX 초과 → 강제 출발
+    4. 리더(첫 배치 채운 Lot)가 설비 점유 → ptime 처리
+    5. 멤버는 리더 완료 이벤트 대기 → 통과
+
+    고장 처리:
+    - is_down 플래그만 사용
+    - 처리 시작 전 is_down 체크 → 복구까지 대기
+    """
+    BATCH_WAIT_MAX = 200.0  # 분
+
+    def __init__(self, env, name, capacity=1,
+                 is_batch=False, batch_min_wafers=1, batch_max_wafers=1):
+        self.env               = env
+        self.name              = name
+        self.res               = simpy.Resource(env, capacity=capacity)
+        self.is_batch          = is_batch
+        self.batch_min_wafers  = max(1, batch_min_wafers)
+        self.batch_max_wafers  = max(1, batch_max_wafers)
+        self.batch_queue       = []
+        self.batch_done_event  = None
+        self.is_down           = False
+        self.current_setup     = None
         self.stats = {
-            "util_time": 0,
-            "setup_time": 0,
-            "down_time": 0,
+            "util_time":      0.0,
+            "setup_time":     0.0,
+            "down_time":      0.0,
             "lots_processed": 0,
-            "total_wait_time": 0,
         }
 
     @property
-    def state(self):
-        """설비 상태를 우선순위에 따라 정확하게 반환"""
+    def state(self) -> str:
         if self.is_down:
             return "down"
         if self.res.count > 0:
             return "busy"
-        if self.is_batch and len(self.batch_queue) > 0:
+        if self.is_batch and self.batch_queue:
             return "setup"
         return "idle"
 
     @property
-    def utilization(self):
-        """가동률 (%) — util_time / env.now"""
-        if self.env.now == 0:
-            return 0.0
-        return round((self.stats["util_time"] / self.env.now) * 100, 1)
+    def utilization(self) -> float:
+        now = self.env.now
+        return round(self.stats["util_time"] / now * 100, 1) if now > 0 else 0.0
 
-    def process(self, lot, ptime, setup_req, setup_cost):
-        # 1. 셋업 변경
-        if setup_req and self.current_setup != setup_req:
+    @property
+    def queued_wafers(self) -> int:
+        return sum(lot.wafers for lot in self.batch_queue)
+
+    def _release_batch(self):
+        """배치 큐 모두 깨우고 초기화"""
+        waiting = list(self.batch_queue)
+        self.batch_queue = []
+        for l in waiting:
+            if l.wait_event and not l.wait_event.triggered:
+                l.wait_event.succeed()
+
+    def process(self, lot, ptime: float, setup_req: str,
+                setup_cost: float, proc_unit: str = "Lot"):
+        """
+        proc_unit:
+          'Batch' → ptime 그대로 (배치 전체 처리시간)
+          'Lot'   → ptime 그대로
+          'Wafer' → ptime × lot.wafers
+        """
+        # 고장 복구 대기
+        while self.is_down:
+            yield self.env.timeout(30)
+
+        # 처리시간 계산
+        if proc_unit == "Wafer":
+            actual_ptime = max(0.01, ptime * lot.wafers)
+        else:
+            actual_ptime = max(0.01, ptime)
+
+        # 셋업 변경
+        if setup_req and setup_req != self.current_setup and setup_cost > 0:
             self.stats["setup_time"] += setup_cost
             yield self.env.timeout(setup_cost)
             self.current_setup = setup_req
 
-        # 2. 배치 대기
         if self.is_batch:
-            self.batch_queue.append(lot)
-            lot.wait_event = self.env.event()
-            if len(self.batch_queue) >= self.min_batch:
-                for l in self.batch_queue:
-                    if not l.wait_event.triggered:
-                        l.wait_event.succeed()
-                self.batch_queue = []
-            else:
-                yield lot.wait_event
+            yield self.env.process(self._batch_proc(lot, actual_ptime))
+        else:
+            yield self.env.process(self._single_proc(lot, actual_ptime))
 
-        # 3. 설비 점유 및 처리
-        with self.res.request(priority=lot.priority) as req:
-            wait_start = self.env.now
+    def _single_proc(self, lot, ptime: float):
+        """비배치 개별 처리"""
+        with self.res.request() as req:
             yield req
-            self.stats["total_wait_time"] += (self.env.now - wait_start)
-
-            start_proc = self.env.now
+            while self.is_down:
+                yield self.env.timeout(30)
+            start = self.env.now
             lot.current_station = self.name
-            try:
+            yield self.env.timeout(ptime)
+            self.stats["util_time"]      += self.env.now - start
+            self.stats["lots_processed"] += 1
+
+    def _batch_proc(self, lot, ptime: float):
+        """
+        배치 처리 — 독립 done_event 구조
+
+        핵심 수정:
+        - 배치 출발 시 done_event를 생성하고 모든 멤버의 lot.batch_done_ev에 직접 심음
+        - 멤버는 자신의 lot.batch_done_ev를 참조 → 인스턴스 변수 덮어쓰기 문제 제거
+        """
+        self.batch_queue.append(lot)
+        lot.wait_event    = self.env.event()
+        lot.batch_done_ev = None   # 배치 출발 시 리더가 채워줌
+        is_leader = False
+
+        if self.queued_wafers >= self.batch_min_wafers:
+            self._release_batch_with_event(lot)
+        else:
+            timeout_ev = self.env.timeout(self.BATCH_WAIT_MAX)
+            yield lot.wait_event | timeout_ev
+            if not lot.wait_event.triggered:
+                self._release_batch_with_event(lot)
+
+        # 리더 여부: 리더는 batch_done_ev를 직접 완료시켜야 하는 주체
+        # _release_batch_with_event 안에서 lot.is_leader 플래그 설정
+        is_leader = getattr(lot, 'is_leader', False)
+
+        lot.current_station = self.name
+
+        if is_leader:
+            # 리더: 설비 점유 → 처리 → 자신의 done_ev 완료
+            with self.res.request() as req:
+                yield req
+                while self.is_down:
+                    yield self.env.timeout(30)
+                start = self.env.now
                 yield self.env.timeout(ptime)
-                self.stats["util_time"] += (self.env.now - start_proc)
+                self.stats["util_time"]      += self.env.now - start
                 self.stats["lots_processed"] += 1
-            except simpy.Interrupt:
-                remaining = ptime - (self.env.now - start_proc)
-                yield self.env.timeout(remaining)
-                self.stats["util_time"] += ptime
+
+            # 자신의 done_ev 완료 → 멤버들이 깨어남
+            if lot.batch_done_ev and not lot.batch_done_ev.triggered:
+                lot.batch_done_ev.succeed()
+        else:
+            # 멤버: 자신에게 심긴 done_ev 대기
+            if lot.batch_done_ev and not lot.batch_done_ev.triggered:
+                yield lot.batch_done_ev
+            else:
+                yield self.env.timeout(0)
+            self.stats["lots_processed"] += 1
+
+    def _release_batch_with_event(self, trigger_lot=None):
+        """
+        배치 큐 전체를 깨우고,
+        이번 배치 전용 done_event를 생성해 모든 Lot에 심어줌.
+        큐의 첫 번째 Lot이 리더 → is_leader=True 설정.
+        trigger_lot: 타임아웃이나 수량 충족을 감지한 Lot (리더 후보)
+        """
+        waiting = list(self.batch_queue)
+        self.batch_queue = []
+
+        if not waiting:
+            return
+
+        # 이번 배치 전용 done_event (모든 멤버가 공유)
+        done_ev = self.env.event()
+
+        # 리더 = 큐의 첫 번째 Lot
+        leader = waiting[0]
+        leader.is_leader = True
+
+        for l in waiting:
+            l.batch_done_ev = done_ev  # 같은 이벤트 공유
+            if l is not leader:
+                l.is_leader = False
+                if l.wait_event and not l.wait_event.triggered:
+                    l.wait_event.succeed()
+
+        # 리더 wait_event 트리거 (배치 출발)
+        if leader.wait_event and not leader.wait_event.triggered:
+            leader.wait_event.succeed()
 
 
-def failure_process(env, station, mttf, mttr):
-    """설비 고장 프로세스 — is_down 플래그 반영"""
+def failure_process(env, station: AdvancedStation, mttf: float, mttr: float):
+    """구역 단위 고장 — is_down 플래그만 사용 (Resource interrupt 없음)"""
     while True:
-        # 고장까지 대기
         yield env.timeout(random.expovariate(1.0 / mttf))
-
         station.is_down = True
-        down_duration = random.expovariate(1.0 / mttr)
-
-        with station.res.request(priority=-999) as req:
-            yield req
-            station.stats["down_time"] += down_duration
-            yield env.timeout(down_duration)
-
+        down_dur = random.expovariate(1.0 / mttr)
+        station.stats["down_time"] += down_dur
+        yield env.timeout(down_dur)
         station.is_down = False
-
-
-def lot_process(env, lot, route_steps, stations, completed_lots, kpi_tracker):
-    """
-    Lot이 route_steps 순서대로 설비를 거치는 전체 공정 프로세스.
-
-    route_steps: [
-        {"station": "Litho_FE_98", "ptime": 45.0, "setup": "TYPE_A", "setup_cost": 10.0},
-        ...
-    ]
-    """
-    lot.total_steps = len(route_steps)
-    lot.current_step = 0
-
-    for step in route_steps:
-        stn_name = step["station"]
-        ptime    = step["ptime"]
-        setup_req = step.get("setup")
-        setup_cost = step.get("setup_cost", 0.0)
-
-        if stn_name not in stations:
-            continue
-
-        stn = stations[stn_name]
-        lot.current_station = stn_name
-        lot.current_step += 1
-
-        yield env.process(stn.process(lot, ptime, setup_req, setup_cost))
-
-    # 완료 처리
-    lot.finish_time = env.now
-    lot.current_station = "DONE"
-    completed_lots.append(lot)
-
-    # KPI 기록
-    cycle_time = lot.finish_time - lot.start_time
-    is_ontime = (lot.due_date is None) or (lot.finish_time <= lot.due_date)
-    kpi_tracker["completed"] += 1
-    kpi_tracker["cycle_times"].append(cycle_time)
-    kpi_tracker["ontime_count"] += int(is_ontime)
-
-
-def lot_release_process(env, orders_df, routes_dict, stations,
-                        active_lots, completed_lots, kpi_tracker):
-    """
-    order.txt 기반으로 Lot을 시뮬레이션 시간에 맞춰 투입하는 프로세스.
-    orders_df 컬럼: PART, PRIORITY, RELEASE_TIME(분), DUE_DATE(분)
-    """
-    lot_counter = 0
-
-    for _, row in orders_df.iterrows():
-        part      = str(row.get("PART", "unknown"))
-        priority  = int(row.get("PRIORITY", 10))
-        release_t = float(row.get("RELEASE_TIME", 0))
-        due_date  = float(row.get("DUE_DATE", 99999))
-        setup_req = str(row.get("SETUP", "DEFAULT"))
-
-        # 투입 시각까지 대기
-        delay = max(0, release_t - env.now)
-        if delay > 0:
-            yield env.timeout(delay)
-
-        lot = Lot(
-            lot_id=f"LOT_{lot_counter:04d}",
-            part=part,
-            start_time=env.now,
-            priority=priority,
-            setup_req=setup_req,
-            due_date=due_date,
-        )
-        lot_counter += 1
-
-        route_key = f"part_{part}"
-        if route_key not in routes_dict:
-            continue
-
-        route_steps = routes_dict[route_key]
-        active_lots.append(lot)
-
-        env.process(
-            lot_process(env, lot, route_steps, stations,
-                        completed_lots, kpi_tracker)
-        )
-
-        # 완료된 Lot은 active에서 제거
-        for done in completed_lots:
-            if done in active_lots:
-                active_lots.remove(done)

@@ -16,10 +16,10 @@ st.set_page_config(
 # ── 경로 설정 ────────────────────────────────────────────────────────────────
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 ENGINE_DIR = os.path.join(BASE_DIR, "A_APOS_Engine")
+# SMT_2020 폴더는 A-APOS_SaaS 상위 폴더에 있음
+DATA_PATH  = os.path.join(BASE_DIR, "..", "SMT_2020 - Final", "AutoSched")
 
-# ── Baseline 리드타임 (데이터셋별) ───────────────────────────────────────────
 BASELINE_MAP = {1: 949, 2: 897, 3: 923, 4: 955}
-
 DS_LABELS = {
     1: "DS1 · HVLM (소품종 대량)",
     2: "DS2 · LVHM (다품종 소량)",
@@ -29,21 +29,22 @@ DS_LABELS = {
 
 # ── Session State 초기화 ─────────────────────────────────────────────────────
 def init_session(ds_id: int):
-    dm   = st.session_state.get("dm") or APOSDataManager(base_path="SMT_2020 - Final/AutoSched")
-    data = dm.load_dataset(ds_id)
-    env  = simpy.Environment()
+    """시뮬레이션 환경 초기화 — dataset 변경 또는 reset 시 호출"""
+    dm     = APOSDataManager(base_path=DATA_PATH)
+    data   = dm.load_dataset(ds_id)
+    env    = simpy.Environment()
     bridge = SimBridge(env, data)
 
-    st.session_state.dm         = dm
-    st.session_state.ds_id      = ds_id
-    st.session_state.data       = data
-    st.session_state.env        = env
-    st.session_state.bridge     = bridge
-    st.session_state.tick       = 0
-    st.session_state.running    = False
-    st.session_state.kpi_log    = []    # {"tick", "wip", "ct", "ontime", "down"}
+    st.session_state.dm      = dm
+    st.session_state.ds_id   = ds_id
+    st.session_state.data    = data
+    st.session_state.env     = env
+    st.session_state.bridge  = bridge
+    st.session_state.tick    = 0
+    st.session_state.running = False
+    st.session_state.kpi_log = []
 
-if "dm" not in st.session_state:
+if "bridge" not in st.session_state:
     init_session(4)
 
 # ── 사이드바 ─────────────────────────────────────────────────────────────────
@@ -67,12 +68,14 @@ with st.sidebar:
 
     # 2. 시뮬레이션 제어
     st.subheader("⚙️ Simulation Control")
-    sim_speed = st.slider("Step Size (분)", 10, 500, 50, step=10,
-                          help="한 번 진행할 시뮬레이션 시간(분). 작을수록 세밀, 클수록 빠름")
+    sim_speed = st.slider(
+        "Step Size (분)", 10, 500, 50, step=10,
+        help="한 번 진행할 시뮬레이션 시간(분). 작을수록 세밀, 클수록 빠름"
+    )
 
     col1, col2 = st.columns(2)
     with col1:
-        run_btn  = st.button("▶ 시작", use_container_width=True, type="primary")
+        run_btn  = st.button("▶ 시작",  use_container_width=True, type="primary")
     with col2:
         stop_btn = st.button("⏹ 중단", use_container_width=True)
     reset_btn = st.button("🔄 초기화", use_container_width=True)
@@ -87,19 +90,22 @@ with st.sidebar:
 
     st.divider()
 
-    # 3. 실시간 KPI (사이드바)
+    # 3. 실시간 KPI
     st.subheader("📊 실시간 KPI")
     summary = st.session_state.bridge.get_summary()
 
     st.metric("Sim Time (Tick)", f"T+{st.session_state.tick}")
-    st.metric("WIP (재공품)", f"{summary['wip']:,} lots")
-    st.metric("완료 Lot", f"{summary['completed']:,} lots")
+    st.metric("WIP (재공품)",    f"{summary['wip']:,} lots")
+    st.metric("완료 Lot",        f"{summary['completed']:,} lots")
 
     kh = st.session_state.bridge.kpi_history
     if kh:
         last = kh[-1]
         st.metric("평균 Cycle Time", f"{last['ct']:.0f} h")
-        st.metric("납기 준수율", f"{last['ontime']:.1f} %")
+        st.metric("납기 준수율",     f"{last['ontime']:.1f} %")
+    else:
+        st.metric("평균 Cycle Time", "0 h")
+        st.metric("납기 준수율",     "0.0 %")
 
     c1, c2, c3 = st.columns(3)
     c1.metric("🟦 Busy",  summary["busy"])
@@ -110,18 +116,22 @@ with st.sidebar:
 
     # 4. What-if Controller
     st.subheader("🎛️ What-if Controller")
-    st.caption("특정 설비를 강제로 다운시켜 AI 회복력을 테스트합니다")
+    st.caption("설비를 강제 다운시켜 AI 회복력을 테스트합니다")
 
     stn_names = sorted(list(st.session_state.bridge.stations.keys()))
     forced_stn = st.selectbox("설비 선택", ["(없음)"] + stn_names)
     forced_dur = st.slider("강제 다운 시간 (분)", 30, 1440, 120, step=30)
+
     if st.button("⚠️ 강제 다운 적용", use_container_width=True):
         if forced_stn != "(없음)":
             st.session_state.bridge.force_station_down(forced_stn, forced_dur)
             st.warning(f"{forced_stn} → {forced_dur}분 다운 예약됨")
 
     st.divider()
-    st.caption(f"A-APOS v2.0 · Dataset {st.session_state.ds_id}\nBaseline LT: {BASELINE_MAP[st.session_state.ds_id]}h")
+    st.caption(
+        f"A-APOS v2.0 · Dataset {st.session_state.ds_id}\n"
+        f"Baseline LT: {BASELINE_MAP[st.session_state.ds_id]}h"
+    )
 
 # ── UI 데이터 준비 ────────────────────────────────────────────────────────────
 current_state = st.session_state.bridge.update_ui_state()
@@ -130,7 +140,6 @@ current_state.update({
     "stn_names": stn_names,
     "ds_name":   DS_LABELS[st.session_state.ds_id],
     "metadata":  st.session_state.data["metadata"],
-    # 실제 breakdown 데이터를 대시보드로 전달
     "breakdown": [
         {"area": "Def_Met",    "mttf": 10080, "mttr": 35.28},
         {"area": "Dielectric", "mttf": 10080, "mttr": 604.8},
@@ -144,7 +153,6 @@ current_state.update({
         {"area": "TF_Met",     "mttf": 10080, "mttr": 35.28},
         {"area": "Wet_Etch",   "mttf": 10080, "mttr": 221.76},
     ],
-    # KPI 히스토리 (차트용 실제 데이터)
     "wip_history": current_state.get("wip_history", []),
     "kpi_history": current_state.get("kpi_history", []),
 })
@@ -166,15 +174,14 @@ if os.path.exists(html_path):
 
     data_injection = f"const realData = {json.dumps(current_state, ensure_ascii=False)};"
     final_html = html_template.replace("// [DATA_INJECTION_POINT]", data_injection)
-
     components.html(final_html, height=1500, scrolling=False)
 else:
-    st.error(f"❌ dashboard.html 파일 없음: {html_path}")
-    st.info("A_APOS_Engine/ 폴더 안에 dashboard.html을 넣어주세요.")
+    st.error(f"❌ dashboard.html 없음: {html_path}")
 
 # ── 시뮬레이션 루프 ───────────────────────────────────────────────────────────
+# running 플래그 방식 — 중단 버튼이 정상 작동함
 if st.session_state.running:
     st.session_state.tick += sim_speed
     st.session_state.bridge.run_step(until=st.session_state.tick)
-    time.sleep(0.1)   # CPU 과부하 방지
+    time.sleep(0.1)
     st.rerun()
