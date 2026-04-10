@@ -12,45 +12,59 @@ class APOSDataManager:
             4: "dataset 4/LVHM_E_Model/LVHM_E_Model.asd"
         }
 
-    def robust_read_csv(self, file_path, sep='\t'):
-        for encoding in ['utf-8', 'utf-16', 'utf-16-le', 'latin1', 'cp949']:
-            try:
-                df = pd.read_csv(file_path, sep=sep, encoding=encoding, on_bad_lines='skip')
-                return df
-            except:
-                continue
-        return pd.DataFrame()
-
     def load_dataset(self, ds_id):
-        current_dir = os.getcwd()
-        path = os.path.join(current_dir, self.base_path, self.datasets[ds_id])
+        path = os.path.join(self.base_path, self.datasets[ds_id])
         
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Data path not found: {path}")
-
-        orders = self.robust_read_csv(os.path.join(path, "order.txt"))
+        # 1. Order Data
+        orders = pd.read_csv(os.path.join(path, "order.txt"), sep='\t')
+        
+        # 2. Route Data (D1/D3 have route_3,4 / D2/D4 have route_1~10)
         routes = {}
         for file in os.listdir(path):
             if file.startswith("route_") and file.endswith(".txt"):
                 part_id = file.split("_")[1].split(".")[0]
-                routes[f"part_{part_id}"] = self.robust_read_csv(os.path.join(path, file))
+                routes[f"part_{part_id}"] = pd.read_csv(os.path.join(path, file), sep='\t')
         
-        setup_matrix = self.robust_read_csv(os.path.join(path, "setup.txt"))
-        downs = self.robust_read_csv(os.path.join(path, "downcal.txt")) if ds_id in [3, 4] else None
+        # 3. Setup Data
+        setup_matrix = pd.read_csv(os.path.join(path, "setup.txt"), sep='\t')
         
-        # --- Intelligence Extraction ---
-        metadata = {
-            "total_parts": len(routes),
-            "total_orders": len(orders),
-            "avg_steps": int(np.mean([len(df) for df in routes.values()])) if routes else 0,
-            "bn_candidates": []
-        }
-        
-        # 병목 후보군 추출 (Batch 수량이 100개 이상이거나 Setup 시간이 60분 이상인 설비)
-        for df in routes.values():
-            if 'STNFAM' in df.columns:
-                candidates = df[(df['BATCHMN'] >= 100) | (df['STIME'] >= 60)]['STNFAM'].unique().tolist()
-                metadata["bn_candidates"].extend(candidates)
-        metadata["bn_candidates"] = list(set(metadata["bn_candidates"]))
+        # 4. Down/PM (D3, D4 Only)
+        downs = None
+        if ds_id in [3, 4]:
+            downs = pd.read_csv(os.path.join(path, "downcal.txt"), sep='\t')
             
-        return {"orders": orders, "routes": routes, "setup": setup_matrix, "downs": downs, "metadata": metadata}
+        return {
+            "orders": orders,
+            "routes": routes,
+            "setup": setup_matrix,
+            "downs": downs,
+            "path": path
+        }
+
+    def get_graph_structure(self, ds_id):
+        """Future GNN Input: Returns nodes and edges based on routes"""
+        data = self.load_dataset(ds_id)
+        nodes = []
+        edges = []
+        
+        # Collect all unique stations across all routes
+        all_steps = pd.concat(data['routes'].values())
+        unique_stns = all_steps['STNFAM'].unique()
+        
+        for stn in unique_stns:
+            nodes.append({"id": stn, "type": "station"})
+            
+        # Create edges based on sequence in routes
+        for part, df in data['routes'].items():
+            for i in range(len(df) - 1):
+                edges.append({
+                    "from": df.iloc[i]['STNFAM'],
+                    "to": df.iloc[i+1]['STNFAM'],
+                    "part": part
+                })
+                
+        return {"nodes": nodes, "edges": edges}
+
+if __name__ == "__main__":
+    dm = APOSDataManager()
+    print(f"Dataset 4 Graph Nodes: {len(dm.get_graph_structure(4)['nodes'])}")
