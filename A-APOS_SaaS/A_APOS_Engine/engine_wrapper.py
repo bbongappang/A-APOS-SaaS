@@ -305,20 +305,25 @@ class SimBridge:
         yield self.env.timeout(0)
 
     def _find_route(self, part: str, rkeys: list) -> str:
-        """Product_1 → part_1 → route_steps 키 탐색"""
-        num = part.split('_')[-1]   # "Product_1" → "1", "part_3" → "3"
-        for candidate in [
-            f"part_{part}",         # part_part_1
-            part,                    # part_1
-            f"part_{num}",           # part_1
-        ]:
-            if candidate in self.route_steps:
-                return candidate
-        # E product 매핑: part_E1 → route_E1
-        if 'E' in num.upper():
-            ekey = f"part_{num.upper()}"
-            if ekey in self.route_steps:
-                return ekey
+        """Product_1 -> part_1 -> route_steps 키 탐색"""
+        # "Product_1" -> "1", "part_1" -> "1"
+        num = part.split('_')[-1]
+        
+        # 우선순위 1: part_{숫자} 형태 (가장 표준)
+        target = f"part_{num}"
+        if target in self.route_steps:
+            return target
+            
+        # 우선순위 2: r_{숫자} 형태 (일부 txt 파일 내부 이름)
+        target_r = f"r_{num}"
+        for rk in rkeys:
+            if rk.endswith(f"_{num}"):
+                return rk
+                
+        # 우선순위 3: 입력값 그대로
+        if part in self.route_steps:
+            return part
+            
         return rkeys[0]
 
     def _repeat_release(self, lot_name, part, priority, wafers,
@@ -386,7 +391,7 @@ class SimBridge:
 
         completed  = self.kpi_tracker["completed"]
         cts        = self.kpi_tracker["cycle_times"]
-        avg_ct     = round(float(np.mean(cts)), 1) if cts else 0.0
+        avg_ct     = round(float(np.mean(cts)) / 60.0, 1) if cts else 0.0
         ontime_pct = round(self.kpi_tracker["ontime_count"] / completed * 100, 1) \
                      if completed > 0 else 0.0
         down_count = sum(1 for s in stn_states if s["state"] == "down")
